@@ -30,6 +30,11 @@ IMAGES_DIR = "images"
 IMAGE_SIZE = 480
 SEED = 42
 
+def t_or_f(arg):
+    ua = str(arg).upper()
+    if 'TRUE'.startswith(ua): return True
+    else: return False
+
 config = SimpleNamespace(
     framework="huggingface",
     img_size=IMAGE_SIZE,
