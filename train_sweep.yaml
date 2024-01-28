@@ -1,0 +1,25 @@
+# The program to run
+program: train.py
+
+# Method can be grid, random or bayes
+method: random
+
+# Project this sweep is part of
+project: fanthom_challenge
+
+# Metric to optimize
+metric:
+  goal: minimize
+  name: validation_loss
+
+# Parameters space to search
+parameters:
+  model_name:
+    values:
+      - 'yolos'
+      - 'DETA'
+      - 'CondDETR'
+  training_mode:
+    values:
+      - 'training_mode'
+      - 'full'
