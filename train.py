@@ -44,8 +44,9 @@ config = SimpleNamespace(
     learning_rate=1e-5,
     weight_decay=1e-4,
     pretrained=True,
-    mixed_precision=True,
-    model_name="yolos",
+    mixed_precision=False,
+    mode
+    l_name="yolos",
     training_mode="bbox_classifier",
     seed=SEED,
     log_preds=False,
@@ -61,6 +62,7 @@ def parse_args():
     argparser.add_argument('--learning_rate', type=float, default=config.learning_rate, help='learning rate')
     argparser.add_argument('--model_name', type=str, default=config.model_name, help='architecture')
     argparser.add_argument('--augment', type=t_or_f, default=config.augment, help='Use image augmentation')
+    argparser.add_argument('--training_mode', type=t_or_f, default=config.training_mode, help='Training mode - full or just the last layer')
     argparser.add_argument('--seed', type=int, default=config.seed, help='random seed')
     argparser.add_argument('--log_preds', type=t_or_f, default=config.log_preds, help='log model predictions')
     argparser.add_argument('--pretrained', type=t_or_f, default=config.pretrained, help='Use pretrained model')
@@ -119,7 +121,7 @@ def process_data(data: dict, data_path: str):
             if y >= height:
                 continue
             if y + h > height:
-                y = height - y
+                h = height - y
             
             anno["bbox"] = [x, y, w, h]
             curr_annos.append(anno)
@@ -274,13 +276,16 @@ if __name__ == "__main__":
     train_data = process_data(train_data, images_path)
 
     model, image_processor, is_yolo = get_training_params(
-        config.architecture, label2id, id2label, config.training_mode
+        config, label2id, id2label
     )
+    train_dataset = SeaWorldDataset(train_data, image_processor, is_augment=True)
+    val_dataset = SeaWorldDataset(val_data, image_processor, is_augment=False)
+    
     run_name = f"{config.model_name}_{config.training_mode}_tuned"
     training_args = TrainingArguments(
         output_dir=run_name,
         per_device_train_batch_size=config.batch_size,
-        num_train_epochs=config.num_train_epochs,
+        num_train_epochs=config.epochs,
         logging_steps=10,
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
@@ -292,6 +297,14 @@ if __name__ == "__main__":
         save_strategy="epoch",
         report_to="wandb",
         run_name=run_name
+    )
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        data_collator=lambda batch: collate_fn(batch, is_yolo),
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        tokenizer=image_processor,
     )
     trainer.train()
     wandb.finish()
