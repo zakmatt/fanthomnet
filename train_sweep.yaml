@@ -17,9 +17,12 @@ parameters:
   model_name:
     values:
       - 'yolos'
-      - 'DETA'
       - 'CondDETR'
+  learning_rate:
+    values:
+      - 1e-5
+      - 1e-4
+      - 1e-3
   training_mode:
     values:
       - 'bbox_classifier'
-      - 'full'

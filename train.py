@@ -1,5 +1,6 @@
 import albumentations
 import argparse
+import functools
 import json
 import numpy as np
 import os
@@ -10,6 +11,7 @@ import wandb
 from glob import glob
 from pathlib import Path
 from PIL import Image, ImageDraw
+from torchmetrics.detection import MeanAveragePrecision
 from torch.utils.data import Dataset, DataLoader
 from tqdm.autonotebook import tqdm
 from transformers import (
@@ -37,15 +39,14 @@ def t_or_f(arg):
 
 config = SimpleNamespace(
     framework="huggingface",
-    img_size=IMAGE_SIZE,
+    #img_size=IMAGE_SIZE,
     batch_size=8,
     augment=True,
     epochs=10,
     learning_rate=1e-5,
     weight_decay=1e-4,
     pretrained=True,
-    mixed_precision=False,
-    mode
+    mixed_precision=True,
     l_name="yolos",
     training_mode="bbox_classifier",
     seed=SEED,
@@ -56,7 +57,6 @@ config = SimpleNamespace(
 def parse_args():
     "Overriding default argments"
     argparser = argparse.ArgumentParser(description='Process hyper-parameters')
-    argparser.add_argument('--img_size', type=int, default=config.img_size, help='image size')
     argparser.add_argument('--batch_size', type=int, default=config.batch_size, help='batch size')
     argparser.add_argument('--epochs', type=int, default=config.epochs, help='number of training epochs')
     argparser.add_argument('--learning_rate', type=float, default=config.learning_rate, help='learning rate')
@@ -147,18 +147,22 @@ class SeaWorldDataset(Dataset):
         if is_augment:
             self._transform = albumentations.Compose(
                 [
-                    albumentations.Resize(580, 580),
+                    albumentations.ShiftScaleRotate(
+                        shift_limit=(0, 0.3),
+                        scale_limit=0.2,
+                        rotate_limit=(-20, 20)
+                    ),
                     albumentations.HorizontalFlip(p=.5),
+                    albumentations.VerticalFlip(p=.5),
                     albumentations.RandomBrightnessContrast(p=.5),
-                    albumentations.Rotate(limit=30),
-                    albumentations.RandomCrop(IMAGE_SIZE, IMAGE_SIZE)
+                    albumentations.LongestMaxSize(image_processor.size["longest_edge"], always_apply=True),
                 ],
                 bbox_params=albumentations.BboxParams(format="coco", label_fields=["categories"]),
             )
         else:
             self._transform = albumentations.Compose(
                 [
-                    albumentations.Resize(IMAGE_SIZE, IMAGE_SIZE),
+                    albumentations.LongestMaxSize(image_processor.size["longest_edge"], always_apply=True),
                 ],
                 bbox_params=albumentations.BboxParams(format="coco", label_fields=["categories"]),
             )
@@ -243,9 +247,9 @@ def get_training_params(config, label2id, id2label):
         checkpoint = "hustvl/yolos-small"
         is_yolo = True
         model = create_model(checkpoint)
-        if config.training_mode == "bbox_classifier":
-            for param in model.vit.parameters():
-                param.requires_grad = False
+        #if config.training_mode == "bbox_classifier":
+        for param in model.vit.parameters():
+            param.requires_grad = False
     else:
         if config.model_name == "DETA":
             checkpoint = "jozhang97/deta-swin-large"
@@ -253,17 +257,58 @@ def get_training_params(config, label2id, id2label):
             checkpoint = "microsoft/conditional-detr-resnet-50"
 
         model = create_model(checkpoint)
-        if config.training_mode == "bbox_classifier":
-            for param in model.model.parameters():
-                param.requires_grad = False
+        #if config.training_mode == "bbox_classifier":
+        for param in model.model.parameters():
+            param.requires_grad = False
 
     image_processor = AutoImageProcessor.from_pretrained(checkpoint)
     return model, image_processor, is_yolo
 
 
+def compute_metrics(eval_pred: EvalPrediction, map: MeanAveragePrecision):
+    (scores, pred_boxes, last_hidden_state, encoder_last_hidden_state), labels = eval_pred
+    # scores shape: (batch_size, number of detected anchors, num_classes + 1) last class is the no-object class
+    # pred_boxes shape: (batch_size, number of detected anchors, 4)
+    # https://github.com/openvinotoolkit/open_model_zoo/blob/master/models/public/detr-resnet50/README.md
+    predictions = []
+    for score, box in zip(scores, pred_boxes):
+        # Extract the bounding boxes, labels, and scores from the model's output
+        pred_scores = torch.from_numpy(score[:, :-1])  # Exclude the no-object class
+        pred_boxes = torch.from_numpy(box)
+        pred_labels = torch.argmax(pred_scores, dim=-1)
+
+        # Get the scores corresponding to the predicted labels
+        pred_scores_for_labels = torch.gather(pred_scores, 1, pred_labels.unsqueeze(-1)).squeeze(-1)
+        predictions.append(
+            {
+                "boxes": pred_boxes,
+                "scores": pred_scores_for_labels,
+                "labels": pred_labels,
+            }
+        )
+    target = [
+        {
+            "boxes": torch.from_numpy(labels[i]["boxes"]),
+            "labels": torch.from_numpy(labels[i]["class_labels"]),
+        }
+        for i in range(len(labels))
+    ]
+    map.update(preds=predictions, target=target)
+    results = map.compute()
+
+    # Convert tensors to scalars/lists, MLFlow doesn't really like tensors
+    #formatted_results = dict()
+    #for metric_name, value in results.items():
+    #    value = value.tolist() if isinstance(value, torch.Tensor) else value
+    #    wandb.log({metric_name: value})
+    #    formatted_results[metric_name] = value
+    results = {k: v.tolist() if isinstance(v, torch.Tensor) else v for k, v in results.items()}
+    return results
+
+
 if __name__ == "__main__":
     parse_args()
-    run = wandb.init(project=params.WANDB_PROJECT, entity=params.ENTITY, job_type="training", config=config)
+    #run = wandb.init(project=params.WANDB_PROJECT, entity=params.ENTITY, job_type="training", config=config)
     data_path = download_data()
     with open(os.path.join(data_path, DATASET_FOLDER, TRAIN_DATA), "r") as f:
         train_data = json.load(f)
@@ -280,6 +325,9 @@ if __name__ == "__main__":
     )
     train_dataset = SeaWorldDataset(train_data, image_processor, is_augment=True)
     val_dataset = SeaWorldDataset(val_data, image_processor, is_augment=False)
+
+    mAP = MeanAveragePrecision(box_format="xywh")
+    metrics = functools.partial(compute_metrics, map=mAP, image_processor=image_processor)
     
     run_name = f"{config.model_name}_{config.training_mode}_tuned"
     training_args = TrainingArguments(
@@ -298,12 +346,14 @@ if __name__ == "__main__":
         report_to="wandb",
         run_name=run_name
     )
+    run = wandb.init(project=params.WANDB_PROJECT, entity=params.ENTITY, job_type="training_final_model", config=training_args)
     trainer = Trainer(
         model=model,
         args=training_args,
-        data_collator=lambda batch: collate_fn(batch, is_yolo),
+        data_collator=lambda batch: collate_fn(batch, False),
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
+        compute_metrics=metrics,
         tokenizer=image_processor,
     )
     trainer.train()
