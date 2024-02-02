@@ -17,6 +17,7 @@ from tqdm.autonotebook import tqdm
 from transformers import (
     AutoImageProcessor,
     AutoModelForObjectDetection,
+    EvalPrediction,
     Trainer,
     TrainingArguments
 )
@@ -47,7 +48,7 @@ config = SimpleNamespace(
     weight_decay=1e-4,
     pretrained=True,
     mixed_precision=True,
-    l_name="yolos",
+    model_name="yolos",
     training_mode="bbox_classifier",
     seed=SEED,
     log_preds=False,
@@ -265,50 +266,49 @@ def get_training_params(config, label2id, id2label):
     return model, image_processor, is_yolo
 
 
-def compute_metrics(eval_pred: EvalPrediction, map: MeanAveragePrecision):
-    (scores, pred_boxes, last_hidden_state, encoder_last_hidden_state), labels = eval_pred
-    # scores shape: (batch_size, number of detected anchors, num_classes + 1) last class is the no-object class
-    # pred_boxes shape: (batch_size, number of detected anchors, 4)
-    # https://github.com/openvinotoolkit/open_model_zoo/blob/master/models/public/detr-resnet50/README.md
-    predictions = []
-    for score, box in zip(scores, pred_boxes):
-        # Extract the bounding boxes, labels, and scores from the model's output
-        pred_scores = torch.from_numpy(score[:, :-1])  # Exclude the no-object class
-        pred_boxes = torch.from_numpy(box)
-        pred_labels = torch.argmax(pred_scores, dim=-1)
+class DetectionTrainer(Trainer):
+    def compute_metrics(self, eval_pred: EvalPrediction):
+        """Compute detection metrics"""
 
-        # Get the scores corresponding to the predicted labels
-        pred_scores_for_labels = torch.gather(pred_scores, 1, pred_labels.unsqueeze(-1)).squeeze(-1)
-        predictions.append(
+        _, scores, pred_boxes, last_hidden_state, encoder_last_hidden_state = eval_pred.predictions
+        
+        # scores shape: (number of samples, number of detected anchors, num_classes + 1) last class is the no-object class
+        # pred_boxes shape: (number of samples, number of detected anchors, 4)
+        # https://github.com/openvinotoolkit/open_model_zoo/blob/master/models/public/detr-resnet50/README.md
+        predictions = []
+        for score, box in zip(scores, pred_boxes):
+            # Extract the bounding boxes, labels, and scores from the model's output
+            pred_scores = torch.from_numpy(score[:, :-1])  # Exclude the no-object class
+            pred_boxes = torch.from_numpy(box)
+            pred_labels = torch.argmax(pred_scores, dim=-1)
+    
+            # Get the scores corresponding to the predicted labels
+            pred_scores_for_labels = torch.gather(pred_scores, 1, pred_labels.unsqueeze(-1)).squeeze(-1)
+            predictions.append(
+                {
+                    "boxes": pred_boxes,
+                    "scores": pred_scores_for_labels,
+                    "labels": pred_labels,
+                }
+            )
+        eval_data = self.eval_dataset
+        target = [
             {
-                "boxes": pred_boxes,
-                "scores": pred_scores_for_labels,
-                "labels": pred_labels,
+                "boxes": self.eval_dataset[i]["labels"]["boxes"],
+                "labels": self.eval_dataset[i]["labels"]["class_labels"],
             }
-        )
-    target = [
-        {
-            "boxes": torch.from_numpy(labels[i]["boxes"]),
-            "labels": torch.from_numpy(labels[i]["class_labels"]),
-        }
-        for i in range(len(labels))
-    ]
-    map.update(preds=predictions, target=target)
-    results = map.compute()
-
-    # Convert tensors to scalars/lists, MLFlow doesn't really like tensors
-    #formatted_results = dict()
-    #for metric_name, value in results.items():
-    #    value = value.tolist() if isinstance(value, torch.Tensor) else value
-    #    wandb.log({metric_name: value})
-    #    formatted_results[metric_name] = value
-    results = {k: v.tolist() if isinstance(v, torch.Tensor) else v for k, v in results.items()}
-    return results
+            for i in range(len(self.eval_dataset))
+        ]
+        map.update(preds=predictions, target=target)
+        results = map.compute()
+        results = {k: v.tolist() if isinstance(v, torch.Tensor) else v for k, v in results.items()}
+        return results
 
 
 if __name__ == "__main__":
     parse_args()
     #run = wandb.init(project=params.WANDB_PROJECT, entity=params.ENTITY, job_type="training", config=config)
+    run = wandb.init(project=params.WANDB_PROJECT, entity=params.ENTITY, job_type="training_final_model", config=training_args)
     data_path = download_data()
     with open(os.path.join(data_path, DATASET_FOLDER, TRAIN_DATA), "r") as f:
         train_data = json.load(f)
@@ -326,8 +326,6 @@ if __name__ == "__main__":
     train_dataset = SeaWorldDataset(train_data, image_processor, is_augment=True)
     val_dataset = SeaWorldDataset(val_data, image_processor, is_augment=False)
 
-    mAP = MeanAveragePrecision(box_format="xywh")
-    metrics = functools.partial(compute_metrics, map=mAP, image_processor=image_processor)
     
     run_name = f"{config.model_name}_{config.training_mode}_tuned"
     training_args = TrainingArguments(
@@ -346,15 +344,14 @@ if __name__ == "__main__":
         report_to="wandb",
         run_name=run_name
     )
-    run = wandb.init(project=params.WANDB_PROJECT, entity=params.ENTITY, job_type="training_final_model", config=training_args)
-    trainer = Trainer(
+
+    trainer = DetectionTrainer(
         model=model,
         args=training_args,
         data_collator=lambda batch: collate_fn(batch, False),
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        compute_metrics=metrics,
-        tokenizer=image_processor,
+        tokenizer=image_processor
     )
     trainer.train()
     wandb.finish()
