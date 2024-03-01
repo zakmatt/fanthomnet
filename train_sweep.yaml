@@ -1,5 +1,5 @@
 # The program to run
-program: train.py
+program: train_yolov8.py
 
 # Method can be grid, random or bayes
 method: random
@@ -14,10 +14,6 @@ metric:
 
 # Parameters space to search
 parameters:
-  model_name:
-    values:
-      - 'yolos'
-      - 'CondDETR'
   learning_rate:
     values:
       - 1e-5
@@ -25,4 +21,5 @@ parameters:
       - 1e-3
   training_mode:
     values:
-      - 'bbox_classifier'
+      - full
+      - detector
